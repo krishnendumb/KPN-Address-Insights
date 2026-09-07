@@ -11,6 +11,7 @@ import { enrichPoint } from "./services/geoenrichment";
 import { nearbyPlaces, PLACE_CATEGORIES } from "./services/places";
 import { sampleElevation } from "./services/elevation";
 import { solveRoute, type RouteResult } from "./services/routing";
+import { ENRICHMENT_COLLECTIONS } from "./data/enrichmentVariables";
 
 let currentSceneView: SceneView | null = null;
 let miniViews: MapView[] = [];
@@ -22,6 +23,33 @@ function destroyAllViews() {
   miniViews = [];
 }
 
+function buildVariablePanel(): string {
+  return `
+    <calcite-block heading="Customize data" description="Choose which GeoEnrichment variables to fetch" collapsible open>
+      <div class="var-picker-actions">
+        <calcite-button appearance="outline" scale="s" id="select-all-vars">Select all</calcite-button>
+        <calcite-button appearance="outline" scale="s" id="select-none-vars">Select none</calcite-button>
+      </div>
+      ${ENRICHMENT_COLLECTIONS.map((c) => `
+        <calcite-block heading="${c.label}" collapsible>
+          ${c.variables.map((v) => `
+            <calcite-label layout="inline" class="var-checkbox-label">
+              <calcite-checkbox class="var-checkbox" data-key="${c.collectionId}.${v.id}" checked></calcite-checkbox>
+              ${v.label}
+            </calcite-label>
+          `).join("")}
+        </calcite-block>
+      `).join("")}
+    </calcite-block>
+  `;
+}
+
+function getSelectedVariableKeys(root: HTMLElement): string[] {
+  return Array.from(root.querySelectorAll<any>(".var-checkbox"))
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.dataset.key as string);
+}
+
 export function renderApp(root: HTMLElement) {
   root.innerHTML = `
     <div class="app-shell">
@@ -29,6 +57,7 @@ export function renderApp(root: HTMLElement) {
         <calcite-input id="address-input" placeholder="Enter an address" style="width: 420px"></calcite-input>
         <calcite-button id="search-btn">Search</calcite-button>
       </div>
+      <div class="var-picker">${buildVariablePanel()}</div>
       <div id="results"></div>
     </div>
   `;
@@ -37,18 +66,27 @@ export function renderApp(root: HTMLElement) {
   const button = root.querySelector("#search-btn") as HTMLElement;
   const results = root.querySelector("#results") as HTMLDivElement;
 
-  button.addEventListener("click", () => runSearch(input.value, results));
+  root.querySelector("#select-all-vars")?.addEventListener("click", () => {
+    root.querySelectorAll<any>(".var-checkbox").forEach((cb) => (cb.checked = true));
+  });
+  root.querySelector("#select-none-vars")?.addEventListener("click", () => {
+    root.querySelectorAll<any>(".var-checkbox").forEach((cb) => (cb.checked = false));
+  });
+
+  button.addEventListener("click", () => {
+    const variableKeys = getSelectedVariableKeys(root);
+    runSearch(input.value, results, variableKeys);
+  });
 }
 
-// Bump this whenever the bundle shape changes -- old cache entries under a
-// different version are ignored instead of rendering with stale/missing
-// fields (e.g. the enrichment field names changed entirely this round).
-const CACHE_VERSION = "v3";
+// Bump whenever the bundle shape changes.
+const CACHE_VERSION = "v4";
 
-async function runSearch(addressText: string, results: HTMLDivElement) {
+async function runSearch(addressText: string, results: HTMLDivElement, variableKeys: string[]) {
   if (!addressText) return;
 
-  const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}`;
+  const variableSignature = [...variableKeys].sort().join(",");
+  const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}:${variableSignature}`;
   const cached = sessionStorage.getItem(cacheKey);
 
   results.innerHTML = `<calcite-loader label="Looking up address" active></calcite-loader>`;
@@ -70,16 +108,13 @@ async function runSearch(addressText: string, results: HTMLDivElement) {
       return;
     }
 
-    // Sample destination ~2-3km NE of the address -- a stand-in until
-    // Places is authorized, at which point this should route to a real
-    // result (e.g. coffeeShops[0]) instead.
     const destX = geocoded.location.x + 0.02;
     const destY = geocoded.location.y + 0.015;
 
     const [elevationResult, ringResult, enrichmentResult, placesResult, routeResult] = await Promise.allSettled([
       sampleElevation(geocoded.location.x, geocoded.location.y),
       sampleElevationRing(geocoded.location.x, geocoded.location.y),
-      enrichPoint(geocoded.location.x, geocoded.location.y),
+      enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys),
       nearbyPlaces(geocoded.location.x, geocoded.location.y, PLACE_CATEGORIES.coffeeShops),
       solveRoute(geocoded.location.x, geocoded.location.y, destX, destY),
     ]);
@@ -165,31 +200,33 @@ function createMiniMap(container: HTMLDivElement, x: number, y: number, bufferMi
   return view;
 }
 
-const CONSUMER_STYLES: Record<string, string> = {
-  TYPE_A: "High Earning Urban Professionals",
-  TYPE_B: "Comfortably Off Empty Nesters",
-  TYPE_C: "Modern and Pragmatic Over 50s",
-  TYPE_D: "Well Informed Modern Consumers",
-  TYPE_E: "Affluent Highly Educated Urban Families",
-  TYPE_F: "Security-Oriented Seniors",
-  TYPE_G: "Orientation Seeking Lower and Middle Class Consumers",
-  TYPE_H: "Younger Lower and Middle Class Consumers",
-  TYPE_I: "Modern Younger Families",
-  TYPE_J: "Low-Income Younger Consumers",
-};
+// --- Enrichment-dependent card builders -------------------------------
+// Each checks field presence in the response rather than tracking what
+// was selected separately -- unselected fields simply never come back.
 
-function buildDominantSegment(enrichment: Record<string, any>) {
-  const entries = Object.entries(CONSUMER_STYLES)
-    .map(([code, label]) => ({ code, label, value: Number(enrichment[code]) || 0 }))
+const consumerStylesLabels = Object.fromEntries(
+  (ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "ConsumerStylesEsriIndia")?.variables ?? [])
+    .map((v) => [v.id, v.label])
+);
+
+function buildDominantSegment(enrichment: Record<string, any>): string | null {
+  const codes = Object.keys(consumerStylesLabels).filter((code) => code in enrichment);
+  if (codes.length === 0) return null;
+
+  const entries = codes
+    .map((code) => ({ code, label: consumerStylesLabels[code], value: Number(enrichment[code]) || 0 }))
     .sort((a, b) => b.value - a.value);
   const total = entries.reduce((sum, e) => sum + e.value, 0) || 1;
   const top = entries[0];
-  const maxVal = top?.value || 1;
+  const maxVal = top.value || 1;
+  const partialNote = codes.length < 10
+    ? `<div class="ai-card__label" style="margin-top:6px">Only ${codes.length} of 10 Consumer Styles selected — share is relative to those, not the full segmentation.</div>`
+    : "";
 
   return `
     <div style="font-weight:600">${top.label}</div>
     <div class="ai-card__stat">${((top.value / total) * 100).toFixed(1)}%</div>
-    <div class="ai-card__stat-label">Share of Consumer Styles population, 1-mile buffer (Esri India / MBR)</div>
+    <div class="ai-card__stat-label">Share of selected Consumer Styles, 1-mile buffer</div>
     <div style="margin-top:10px">
       ${entries.map((e) => `
         <div class="spend-bar-row">
@@ -199,17 +236,49 @@ function buildDominantSegment(enrichment: Record<string, any>) {
         </div>
       `).join("")}
     </div>
+    ${partialNote}
   `;
 }
 
-function buildAgePyramid(enrichment: Record<string, any>) {
+function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
+  const stats: { label: string; value: string }[] = [];
+  if ("TOTPOP_CY" in enrichment) stats.push({ label: "Total", value: formatInt(enrichment.TOTPOP_CY) });
+  if ("MALES_CY" in enrichment) stats.push({ label: "Male", value: formatInt(enrichment.MALES_CY) });
+  if ("FEMALES_CY" in enrichment) stats.push({ label: "Female", value: formatInt(enrichment.FEMALES_CY) });
+  if ("POPDENS_CY" in enrichment) stats.push({ label: "Per km²", value: Number(enrichment.POPDENS_CY).toFixed(0) });
+  if (stats.length === 0) return null;
+
+  return `
+    <div class="stat-grid">
+      ${stats.map((s) => `<div><div class="ai-card__stat" style="font-size:20px">${s.value}</div><div class="ai-card__stat-label">${s.label}</div></div>`).join("")}
+    </div>
+    <div class="ai-card__minimap"></div>
+  `;
+}
+
+function buildPurchasingPower(enrichment: Record<string, any>): string | null {
+  let hero = "";
+  const rows: string[] = [];
+  if ("PP_CY" in enrichment) hero = `<div class="ai-card__stat">₹${formatCompact(enrichment.PP_CY)}</div><div class="ai-card__stat-label">Total, 1-mile buffer (assumed INR — verify against account docs)</div>`;
+  if ("PPPC_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Per capita</span><b>₹${formatInt(enrichment.PPPC_CY)}</b></div>`);
+  if ("PPIDX_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Index vs. national avg.</span><b>${enrichment.PPIDX_CY}</b></div>`);
+  if ("CS01_CY" in enrichment) rows.push(`<div class="ai-card__row"><span>Total consumer spending</span><b>₹${formatCompact(enrichment.CS01_CY)}</b></div>`);
+  if (!hero && rows.length === 0) return null;
+  return `${hero}${rows.join("")}`;
+}
+
+function buildAgePyramid(enrichment: Record<string, any>): string | null {
   const brackets = [
-    { label: "60+", m: enrichment.MAGE05_CY || 0, f: enrichment.FAGE05_CY || 0 },
-    { label: "45–59", m: enrichment.MAGE04_CY || 0, f: enrichment.FAGE04_CY || 0 },
-    { label: "30–44", m: enrichment.MAGE03_CY || 0, f: enrichment.FAGE03_CY || 0 },
-    { label: "15–29", m: enrichment.MAGE02_CY || 0, f: enrichment.FAGE02_CY || 0 },
-    { label: "0–14", m: enrichment.MAGE01_CY || 0, f: enrichment.FAGE01_CY || 0 },
-  ];
+    { label: "60+", mKey: "MAGE05_CY", fKey: "FAGE05_CY" },
+    { label: "45–59", mKey: "MAGE04_CY", fKey: "FAGE04_CY" },
+    { label: "30–44", mKey: "MAGE03_CY", fKey: "FAGE03_CY" },
+    { label: "15–29", mKey: "MAGE02_CY", fKey: "FAGE02_CY" },
+    { label: "0–14", mKey: "MAGE01_CY", fKey: "FAGE01_CY" },
+  ]
+    .map((b) => ({ label: b.label, m: enrichment[b.mKey] || 0, f: enrichment[b.fKey] || 0, present: b.mKey in enrichment || b.fKey in enrichment }))
+    .filter((b) => b.present);
+
+  if (brackets.length === 0) return null;
   const max = Math.max(...brackets.flatMap((b) => [b.m, b.f]), 1);
 
   return `
@@ -223,6 +292,8 @@ function buildAgePyramid(enrichment: Record<string, any>) {
     `).join("")}
   `;
 }
+
+// -----------------------------------------------------------------------
 
 async function renderResults(root: HTMLDivElement, data: any) {
   destroyAllViews();
@@ -271,7 +342,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
     container: sceneDiv,
     map: new Map({ basemap: "arcgis/topographic", ground: "world-elevation", layers: [sceneLayer] }),
     center: [x, y],
-    zoom: 14,
+    zoom: 17,
     ui: { components: ["attribution"] },
   });
   await currentSceneView.when();
@@ -321,7 +392,6 @@ async function renderResults(root: HTMLDivElement, data: any) {
   `);
   createMiniMap(urgentCard.querySelector(".ai-card__minimap")!, x, y);
 
-  // Real routing card
   const routeCard = addCard("teal", "Sample route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
   const routeMinimapDiv = routeCard.querySelector(".ai-card__minimap") as HTMLDivElement;
   const routeInfoDiv = routeCard.querySelector("#route-info") as HTMLDivElement;
@@ -348,7 +418,7 @@ async function renderResults(root: HTMLDivElement, data: any) {
     routeInfoDiv.innerHTML = `
       ${routeData.distanceKm != null ? routeData.distanceKm.toFixed(1) + " km" : "—"} ·
       ${routeData.minutes != null ? Math.round(routeData.minutes) + " min" : "—"}
-      <br><span style="color:#999">Sample destination — swap in a real one (e.g. a Places result) once Places is authorized.</span>
+      <br><span style="color:#999">Sample destination — swap in a real one once Places is authorized.</span>
     `;
   } else {
     routeInfoDiv.textContent = "Route unavailable — check the Routing privilege on your API key.";
@@ -374,41 +444,23 @@ async function renderResults(root: HTMLDivElement, data: any) {
   const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">1-mile buffer used for the enrichment cards below</div>`);
   createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, 1);
 
-  addCard("purple", "Dominant segment", enrichment
-    ? buildDominantSegment(enrichment)
-    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
+  const dominantHtml = enrichment ? buildDominantSegment(enrichment) : null;
+  addCard("purple", "Dominant segment", dominantHtml ?? `<div class="ai-card__stat-label">No Consumer Styles variables selected, or unavailable — check the Demographics privilege.</div>`);
 
-  const popCard = addCard("teal", "Nearby population", enrichment
-    ? `
-      <div class="stat-grid">
-        <div><div class="ai-card__stat" style="font-size:20px">${formatInt(enrichment.TOTPOP_CY ?? 0)}</div><div class="ai-card__stat-label">Total</div></div>
-        <div><div class="ai-card__stat" style="font-size:20px">${formatInt(enrichment.MALES_CY ?? 0)}</div><div class="ai-card__stat-label">Male</div></div>
-        <div><div class="ai-card__stat" style="font-size:20px">${formatInt(enrichment.FEMALES_CY ?? 0)}</div><div class="ai-card__stat-label">Female</div></div>
-        <div><div class="ai-card__stat" style="font-size:20px">${enrichment.POPDENS_CY?.toFixed(0) ?? "—"}</div><div class="ai-card__stat-label">Per km²</div></div>
-      </div>
-      <div class="ai-card__minimap"></div>
-    `
-    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
+  const popHtml = enrichment ? buildNearbyPopulation(enrichment) : null;
+  const popCard = addCard("teal", "Nearby population", popHtml ?? `<div class="ai-card__stat-label">No population variables selected, or unavailable — check the Demographics privilege.</div>`);
   const popMinimap = popCard.querySelector(".ai-card__minimap");
   if (popMinimap) createMiniMap(popMinimap as HTMLDivElement, x, y, 1);
 
-  addCard("teal", "Purchasing power", enrichment
-    ? `
-      <div class="ai-card__stat">₹${formatCompact(enrichment.PP_CY ?? 0)}</div>
-      <div class="ai-card__stat-label">Total, 1-mile buffer (assumed INR — India-specific collection, verify against account docs)</div>
-      <div class="ai-card__row" style="margin-top:8px"><span>Per capita</span><b>₹${formatInt(enrichment.PPPC_CY ?? 0)}</b></div>
-      <div class="ai-card__row"><span>Index vs. national avg.</span><b>${enrichment.PPIDX_CY ?? "—"}</b></div>
-      <div class="ai-card__row"><span>Total consumer spending (CS01)</span><b>₹${formatCompact(enrichment.CS01_CY ?? 0)}</b></div>
-    `
-    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
+  const ppHtml = enrichment ? buildPurchasingPower(enrichment) : null;
+  addCard("teal", "Purchasing power", ppHtml ?? `<div class="ai-card__stat-label">No purchasing power / spending variables selected, or unavailable.</div>`);
 
   addCard("teal", "Mobile carrier share", fakeDonutLegend([
     ["Jio", "#0f6e56"], ["Airtel", "#5dcaa5"], ["Vi", "#b6771a"], ["BSNL", "#d85a30"],
   ]));
 
-  addCard("teal", "Population by age and sex", enrichment
-    ? buildAgePyramid(enrichment)
-    : `<div class="ai-card__stat-label">Unavailable — check the Demographics (GeoEnrichment) privilege on your API key.</div>`);
+  const pyramidHtml = enrichment ? buildAgePyramid(enrichment) : null;
+  addCard("teal", "Population by age and sex", pyramidHtml ?? `<div class="ai-card__stat-label">No age-bracket variables selected, or unavailable.</div>`);
 
   addCard("teal", "Geocoding response", `<pre class="ai-card__json">${JSON.stringify(rawAttributes, null, 2)}</pre>`);
 }

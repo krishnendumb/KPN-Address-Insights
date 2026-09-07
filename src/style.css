@@ -110,3 +110,7 @@ body { margin: 0; font-family: system-ui, sans-serif; background: #f4f3ef; }
 .pyramid-row__fill--m { background: #378add; }
 .pyramid-row__fill--f { background: #d85a30; }
 .pyramid-row__label { width: 44px; text-align: center; font-size: 11px; color: #666; flex-shrink: 0; }
+
+.var-picker { padding: 0 16px; }
+.var-picker-actions { display: flex; gap: 8px; margin-bottom: 10px; }
+.var-checkbox-label { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
