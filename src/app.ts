@@ -183,7 +183,7 @@ async function runSearch(
       destY = nearest.y;
       destLabel = `${nearest.name} (${nearest.category})`;
     }
-
+    console.log(`[route] destination chosen: ${destLabel} at (${destX}, ${destY})`);
     const routeResult = await solveRoute(geocoded.location.x, geocoded.location.y, destX, destY).catch((err) => {
       console.error("Routing failed:", err);
       return null;
@@ -449,15 +449,19 @@ async function renderResults(root: HTMLDivElement, data: any) {
     <div class="ai-card__stat-label">Std. dev. of nearby elevation samples (real, derived)</div>
   `);
 
-  // One real card per selected POI category
-  Object.entries(poiByCategory).forEach(([category, pois]) => {
+  // One real card per selected POI category. Sequential + awaited on
+  // purpose -- firing several MapViews' WebGL contexts in the same
+  // synchronous tick (the old forEach) let some silently fail to render
+  // even though the data was correct.
+  for (const [category, pois] of Object.entries(poiByCategory)) {
     const card = addCard("teal", category, `
       <div class="ai-card__stat">${pois.length}</div>
       <div class="ai-card__stat-label">Found within 1.5 km</div>
       <div class="ai-card__minimap"></div>
     `);
-    createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois);
-  });
+    const view = createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois);
+    await view.when();
+  }
 
   const routeCard = addCard("teal", "Route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
   const routeMinimapDiv = routeCard.querySelector(".ai-card__minimap") as HTMLDivElement;
