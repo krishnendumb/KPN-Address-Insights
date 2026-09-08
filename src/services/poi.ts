@@ -56,17 +56,24 @@ export async function queryNearbyPois(
     spatialRelationship: "intersects",
     where: `${CATEGORY_FIELD} = '${category.replace(/'/g, "''")}'`,
     outFields: ["NAME", CATEGORY_FIELD],
+    returnGeometry: true,
     outSpatialReference: { wkid: 4326 } as any,
   });
 
   console.log(`[poi] querying category "${category}" — where: ${q.where}`);
   const result = await query.executeQueryJSON(POI_LAYER_URL, q);
   console.log(`[poi] "${category}" returned ${result.features.length} feature(s)`);
+  if (result.features[0]) {
+    console.log(`[poi] sample geometry for "${category}":`, result.features[0].geometry);
+  }
 
-  return result.features
+  const mapped = result.features
     .map((f) => {
       const pt = f.geometry as __esri.Point;
       return { name: (f.attributes.NAME as string) || category, category, x: pt?.x, y: pt?.y };
     })
     .filter((p): p is PoiResult => p.x != null && p.y != null);
+
+  console.log(`[poi] "${category}" usable after geometry filter: ${mapped.length}`);
+  return mapped;
 }
