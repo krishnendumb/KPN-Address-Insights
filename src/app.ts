@@ -8,9 +8,9 @@ import BasemapGallery from "@arcgis/core/widgets/BasemapGallery";
 import Expand from "@arcgis/core/widgets/Expand";
 import { geocodeAddress } from "./services/geocode";
 import { enrichPoint } from "./services/geoenrichment";
-import { nearbyPlaces, PLACE_CATEGORIES } from "./services/places";
 import { sampleElevation } from "./services/elevation";
 import { solveRoute, type RouteResult } from "./services/routing";
+import { fetchPoiCategories, queryNearbyPois, type PoiResult } from "./services/poi";
 import { ENRICHMENT_COLLECTIONS } from "./data/enrichmentVariables";
 
 let currentSceneView: SceneView | null = null;
@@ -50,6 +50,31 @@ function getSelectedVariableKeys(root: HTMLElement): string[] {
     .map((cb) => cb.dataset.key as string);
 }
 
+async function buildPoiPicker(container: HTMLElement) {
+  container.innerHTML = `<calcite-loader label="Loading POI categories" active scale="s"></calcite-loader>`;
+  const categories = await fetchPoiCategories();
+  if (categories.length === 0) {
+    container.innerHTML = `<calcite-notice open kind="warning" scale="s"><div slot="message">No POI categories loaded — check POI_LAYER_URL in services/poi.ts, and confirm the API key has item access to this layer.</div></calcite-notice>`;
+    return;
+  }
+  container.innerHTML = `
+    <calcite-block heading="Nearby places" description="Choose which categories to fetch from your uploaded POI layer" collapsible open>
+      ${categories.map((cat) => `
+        <calcite-label layout="inline" class="poi-checkbox-label">
+          <calcite-checkbox class="poi-checkbox" data-category="${cat}"></calcite-checkbox>
+          ${cat}
+        </calcite-label>
+      `).join("")}
+    </calcite-block>
+  `;
+}
+
+function getSelectedPoiCategories(root: HTMLElement): string[] {
+  return Array.from(root.querySelectorAll<any>(".poi-checkbox"))
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.dataset.category as string);
+}
+
 export function renderApp(root: HTMLElement) {
   root.innerHTML = `
     <div class="app-shell">
@@ -58,6 +83,7 @@ export function renderApp(root: HTMLElement) {
         <calcite-button id="search-btn">Search</calcite-button>
       </div>
       <div class="var-picker">${buildVariablePanel()}</div>
+      <div class="poi-picker"></div>
       <div id="results"></div>
     </div>
   `;
@@ -73,20 +99,27 @@ export function renderApp(root: HTMLElement) {
     root.querySelectorAll<any>(".var-checkbox").forEach((cb) => (cb.checked = false));
   });
 
+  buildPoiPicker(root.querySelector(".poi-picker") as HTMLElement);
+
   button.addEventListener("click", () => {
     const variableKeys = getSelectedVariableKeys(root);
-    runSearch(input.value, results, variableKeys);
+    const poiCategories = getSelectedPoiCategories(root);
+    runSearch(input.value, results, variableKeys, poiCategories);
   });
 }
 
-// Bump whenever the bundle shape changes.
-const CACHE_VERSION = "v4";
+const CACHE_VERSION = "v5";
 
-async function runSearch(addressText: string, results: HTMLDivElement, variableKeys: string[]) {
+async function runSearch(
+  addressText: string,
+  results: HTMLDivElement,
+  variableKeys: string[],
+  poiCategories: string[]
+) {
   if (!addressText) return;
 
-  const variableSignature = [...variableKeys].sort().join(",");
-  const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}:${variableSignature}`;
+  const signature = `${[...variableKeys].sort().join(",")}|${[...poiCategories].sort().join(",")}`;
+  const cacheKey = `address-insights:${CACHE_VERSION}:${addressText.toLowerCase().trim()}:${signature}`;
   const cached = sessionStorage.getItem(cacheKey);
 
   results.innerHTML = `<calcite-loader label="Looking up address" active></calcite-loader>`;
@@ -108,21 +141,51 @@ async function runSearch(addressText: string, results: HTMLDivElement, variableK
       return;
     }
 
-    const destX = geocoded.location.x + 0.02;
-    const destY = geocoded.location.y + 0.015;
-
-    const [elevationResult, ringResult, enrichmentResult, placesResult, routeResult] = await Promise.allSettled([
-      sampleElevation(geocoded.location.x, geocoded.location.y),
-      sampleElevationRing(geocoded.location.x, geocoded.location.y),
-      enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys),
-      nearbyPlaces(geocoded.location.x, geocoded.location.y, PLACE_CATEGORIES.coffeeShops),
-      solveRoute(geocoded.location.x, geocoded.location.y, destX, destY),
+    const [otherResults, poiSettled] = await Promise.all([
+      Promise.allSettled([
+        sampleElevation(geocoded.location.x, geocoded.location.y),
+        sampleElevationRing(geocoded.location.x, geocoded.location.y),
+        enrichPoint(geocoded.location.x, geocoded.location.y, variableKeys),
+      ]),
+      Promise.allSettled(poiCategories.map((cat) => queryNearbyPois(geocoded.location.x, geocoded.location.y, cat))),
     ]);
 
+    const [elevationResult, ringResult, enrichmentResult] = otherResults;
     if (elevationResult.status === "rejected") console.error("Elevation failed:", elevationResult.reason);
     if (enrichmentResult.status === "rejected") console.error("Enrichment failed:", enrichmentResult.reason);
-    if (placesResult.status === "rejected") console.error("Places failed:", placesResult.reason);
-    if (routeResult.status === "rejected") console.error("Routing failed:", routeResult.reason);
+
+    const poiByCategory: Record<string, PoiResult[]> = {};
+    poiCategories.forEach((cat, i) => {
+      const r = poiSettled[i];
+      if (r.status === "fulfilled") poiByCategory[cat] = r.value;
+      else {
+        console.error(`POI query failed for "${cat}":`, r.reason);
+        poiByCategory[cat] = [];
+      }
+    });
+
+    // Route target: nearest POI across every selected category. Falls
+    // back to a sample offset point if nothing was selected or found.
+    const allPois = Object.values(poiByCategory).flat();
+    let destX = geocoded.location.x + 0.02;
+    let destY = geocoded.location.y + 0.015;
+    let destLabel = "Sample destination (no POI selected/found)";
+
+    if (allPois.length > 0) {
+      const nearest = allPois.reduce((best, p) => {
+        const d = (p.x - geocoded.location.x) ** 2 + (p.y - geocoded.location.y) ** 2;
+        const bd = (best.x - geocoded.location.x) ** 2 + (best.y - geocoded.location.y) ** 2;
+        return d < bd ? p : best;
+      });
+      destX = nearest.x;
+      destY = nearest.y;
+      destLabel = `${nearest.name} (${nearest.category})`;
+    }
+
+    const routeResult = await solveRoute(geocoded.location.x, geocoded.location.y, destX, destY).catch((err) => {
+      console.error("Routing failed:", err);
+      return null;
+    });
 
     bundle = {
       address: geocoded.address,
@@ -132,9 +195,9 @@ async function runSearch(addressText: string, results: HTMLDivElement, variableK
       elevation: elevationResult.status === "fulfilled" ? elevationResult.value : null,
       elevationSamples: ringResult.status === "fulfilled" ? ringResult.value : [],
       enrichment: enrichmentResult.status === "fulfilled" ? enrichmentResult.value : null,
-      coffeeShops: placesResult.status === "fulfilled" ? placesResult.value : null,
-      route: routeResult.status === "fulfilled" ? routeResult.value : null,
-      destination: { x: destX, y: destY },
+      poiByCategory,
+      route: routeResult,
+      destination: { x: destX, y: destY, label: destLabel },
     };
 
     sessionStorage.setItem(cacheKey, JSON.stringify(bundle));
@@ -200,45 +263,45 @@ function createMiniMap(container: HTMLDivElement, x: number, y: number, bufferMi
   return view;
 }
 
-// --- Enrichment-dependent card builders -------------------------------
-// Each checks field presence in the response rather than tracking what
-// was selected separately -- unselected fields simply never come back.
+function createPoiMiniMap(container: HTMLDivElement, x: number, y: number, pois: { x: number; y: number }[]) {
+  const layer = new GraphicsLayer();
+  layer.add(pointGraphic(x, y, "#0f6e56"));
+  pois.forEach((p) => layer.add(pointGraphic(p.x, p.y, "#378add")));
 
-const consumerStylesLabels = Object.fromEntries(
-  (ENRICHMENT_COLLECTIONS.find((c) => c.collectionId === "ConsumerStylesEsriIndia")?.variables ?? [])
-    .map((v) => [v.id, v.label])
+  const view = new MapView({
+    container,
+    map: new Map({ basemap: "arcgis/streets", layers: [layer] }),
+    center: [x, y],
+    zoom: 15,
+    constraints: { rotationEnabled: false },
+    ui: { components: ["attribution"] },
+  });
+  miniViews.push(view);
+  return view;
+}
+
+// --- Enrichment card builders -------------------------------------------
+// Each checks field presence in the response, not a separately-tracked
+// selection -- unselected fields simply never come back.
+
+const ALL_VARIABLE_LABELS: Record<string, string> = Object.fromEntries(
+  ENRICHMENT_COLLECTIONS.flatMap((c) => c.variables.map((v) => [v.id, v.label]))
 );
 
-function buildDominantSegment(enrichment: Record<string, any>): string | null {
-  const codes = Object.keys(consumerStylesLabels).filter((code) => code in enrichment);
-  if (codes.length === 0) return null;
+const CURATED_FIELDS = new Set([
+  "TOTPOP_CY", "MALES_CY", "FEMALES_CY", "POPDENS_CY",
+  "PP_CY", "PPPC_CY", "PPIDX_CY", "CS01_CY",
+  "MAGE01_CY", "MAGE02_CY", "MAGE03_CY", "MAGE04_CY", "MAGE05_CY",
+  "FAGE01_CY", "FAGE02_CY", "FAGE03_CY", "FAGE04_CY", "FAGE05_CY",
+]);
 
-  const entries = codes
-    .map((code) => ({ code, label: consumerStylesLabels[code], value: Number(enrichment[code]) || 0 }))
-    .sort((a, b) => b.value - a.value);
-  const total = entries.reduce((sum, e) => sum + e.value, 0) || 1;
-  const top = entries[0];
-  const maxVal = top.value || 1;
-  const partialNote = codes.length < 10
-    ? `<div class="ai-card__label" style="margin-top:6px">Only ${codes.length} of 10 Consumer Styles selected — share is relative to those, not the full segmentation.</div>`
-    : "";
-
-  return `
-    <div style="font-weight:600">${top.label}</div>
-    <div class="ai-card__stat">${((top.value / total) * 100).toFixed(1)}%</div>
-    <div class="ai-card__stat-label">Share of selected Consumer Styles, 1-mile buffer</div>
-    <div style="margin-top:10px">
-      ${entries.map((e) => `
-        <div class="spend-bar-row">
-          <span class="spend-bar-row__label" style="width:34px" title="${e.label}">${e.code.replace("TYPE_", "")}</span>
-          <div class="spend-bar-row__track"><div class="spend-bar-row__fill" style="width:${(e.value / maxVal) * 100}%"></div></div>
-          <span class="spend-bar-row__value">${((e.value / total) * 100).toFixed(0)}%</span>
-        </div>
-      `).join("")}
-    </div>
-    ${partialNote}
-  `;
-}
+// Boilerplate fields the enrich response always includes regardless of
+// requested variables -- excluded from the "additional data" catch-all.
+const META_FIELDS = new Set([
+  "OBJECTID", "ID", "HasData", "aggregationMethod", "sourceCountry",
+  "ID_0", "id", "areaType", "bufferUnits", "bufferUnitsAlias", "bufferRadii",
+  "populationToPolygonSizeRating", "apportionmentConfidence",
+]);
 
 function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
   const stats: { label: string; value: string }[] = [];
@@ -247,7 +310,6 @@ function buildNearbyPopulation(enrichment: Record<string, any>): string | null {
   if ("FEMALES_CY" in enrichment) stats.push({ label: "Female", value: formatInt(enrichment.FEMALES_CY) });
   if ("POPDENS_CY" in enrichment) stats.push({ label: "Per km²", value: Number(enrichment.POPDENS_CY).toFixed(0) });
   if (stats.length === 0) return null;
-
   return `
     <div class="stat-grid">
       ${stats.map((s) => `<div><div class="ai-card__stat" style="font-size:20px">${s.value}</div><div class="ai-card__stat-label">${s.label}</div></div>`).join("")}
@@ -277,10 +339,8 @@ function buildAgePyramid(enrichment: Record<string, any>): string | null {
   ]
     .map((b) => ({ label: b.label, m: enrichment[b.mKey] || 0, f: enrichment[b.fKey] || 0, present: b.mKey in enrichment || b.fKey in enrichment }))
     .filter((b) => b.present);
-
   if (brackets.length === 0) return null;
   const max = Math.max(...brackets.flatMap((b) => [b.m, b.f]), 1);
-
   return `
     <div class="pyramid-legend"><span class="pyramid-swatch pyramid-swatch--m"></span>Male<span class="pyramid-swatch pyramid-swatch--f" style="margin-left:14px"></span>Female</div>
     ${brackets.map((b) => `
@@ -293,15 +353,29 @@ function buildAgePyramid(enrichment: Record<string, any>): string | null {
   `;
 }
 
-// -----------------------------------------------------------------------
+function buildAdditionalDataCard(enrichment: Record<string, any>): string | null {
+  const extraKeys = Object.keys(enrichment).filter((k) => !CURATED_FIELDS.has(k) && !META_FIELDS.has(k));
+  if (extraKeys.length === 0) return null;
+  return `
+    <table>
+      <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+      <tbody>
+        ${extraKeys.map((k) => `<tr><td>${ALL_VARIABLE_LABELS[k] ?? k}</td><td>${typeof enrichment[k] === "number" ? formatInt(enrichment[k]) : enrichment[k]}</td></tr>`).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+// -------------------------------------------------------------------------
 
 async function renderResults(root: HTMLDivElement, data: any) {
   destroyAllViews();
 
-  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, route: routeData, destination } = data as {
+  const { address, score, location, rawAttributes, elevation, elevationSamples, enrichment, poiByCategory, route: routeData, destination } = data as {
     address: string; score: number; location: { x: number; y: number }; rawAttributes: any;
     elevation: number | null; elevationSamples: number[]; enrichment: Record<string, any> | null;
-    route: RouteResult | null; destination: { x: number; y: number };
+    poiByCategory: Record<string, PoiResult[]>; route: RouteResult | null;
+    destination: { x: number; y: number; label: string };
   };
   const roughness = stdDev(elevationSamples || []);
   const x = location.x, y = location.y;
@@ -373,26 +447,17 @@ async function renderResults(root: HTMLDivElement, data: any) {
     <div class="ai-card__stat-label">Std. dev. of nearby elevation samples (real, derived)</div>
   `);
 
-  const coffeeCard = addCard("teal", "Coffee shops nearby", data.coffeeShops != null
-    ? `<div class="ai-card__stat">${data.coffeeShops.length}</div><div class="ai-card__stat-label">Within search radius</div><div class="ai-card__minimap"></div>`
-    : `<div class="ai-card__stat-label">Unavailable — check the Places privilege on your API key.</div><div class="ai-card__minimap"></div>`);
-  createMiniMap(coffeeCard.querySelector(".ai-card__minimap")!, x, y);
+  // One real card per selected POI category
+  Object.entries(poiByCategory).forEach(([category, pois]) => {
+    const card = addCard("teal", category, `
+      <div class="ai-card__stat">${pois.length}</div>
+      <div class="ai-card__stat-label">Found within 1.5 km</div>
+      <div class="ai-card__minimap"></div>
+    `);
+    createPoiMiniMap(card.querySelector(".ai-card__minimap")!, x, y, pois);
+  });
 
-  const parkingCard = addCard("teal", "Parking lots nearby", `
-    <div class="ai-card__stat">${fakeInt(8, 30)}</div>
-    <div class="ai-card__stat-label">Placeholder — wire up a parking category ID</div>
-    <div class="ai-card__minimap"></div>
-  `);
-  createMiniMap(parkingCard.querySelector(".ai-card__minimap")!, x, y);
-
-  const urgentCard = addCard("teal", "Urgent cares found", `
-    <div class="ai-card__stat">${fakeInt(3, 20)}</div>
-    <div class="ai-card__stat-label">Placeholder — wire up an urgent-care category ID</div>
-    <div class="ai-card__minimap"></div>
-  `);
-  createMiniMap(urgentCard.querySelector(".ai-card__minimap")!, x, y);
-
-  const routeCard = addCard("teal", "Sample route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
+  const routeCard = addCard("teal", "Route", `<div class="ai-card__minimap"></div><div class="ai-card__label" id="route-info" style="margin-top:8px">—</div>`);
   const routeMinimapDiv = routeCard.querySelector(".ai-card__minimap") as HTMLDivElement;
   const routeInfoDiv = routeCard.querySelector("#route-info") as HTMLDivElement;
 
@@ -416,36 +481,16 @@ async function renderResults(root: HTMLDivElement, data: any) {
     await routeView.goTo(routeLayer.graphics.toArray(), { animate: false });
 
     routeInfoDiv.innerHTML = `
+      To: <b>${destination.label}</b><br>
       ${routeData.distanceKm != null ? routeData.distanceKm.toFixed(1) + " km" : "—"} ·
       ${routeData.minutes != null ? Math.round(routeData.minutes) + " min" : "—"}
-      <br><span style="color:#999">Sample destination — swap in a real one once Places is authorized.</span>
     `;
   } else {
     routeInfoDiv.textContent = "Route unavailable — check the Routing privilege on your API key.";
   }
 
-  addCard("green", "Walkability", `
-    <div class="ai-card__stat" style="font-size:20px">Fair</div>
-    <div class="ai-card__row"><span>Slope</span><b>Fair</b></div>
-    <div class="ai-card__row"><span>Distance</span><b>Fair</b></div>
-    <div class="ai-card__row"><span>POI coverage</span><b>Fair</b></div>
-    <div class="ai-card__label" style="margin-top:8px">Placeholder — combine slope + POI coverage for a real score</div>
-  `);
-
-  addCard("green", "Marital status", fakeDonutLegend([
-    ["Married", "#0f6e56"], ["Never married", "#5dcaa5"], ["Widowed", "#b6771a"], ["Divorced", "#d85a30"],
-  ]));
-
-  addCard("pink", "Trust social media the most", fakeSurveyBar());
-  addCard("pink", "Buying American matters", fakeSurveyBar());
-  addCard("pink", "I am careful with my money", fakeSurveyBar());
-  addCard("pink", "Hate going to my bank", fakeSurveyBar());
-
   const demoCard = addCard("teal", "Demographics analysis area", `<div class="ai-card__minimap"></div><div class="ai-card__label" style="margin-top:8px">1-mile buffer used for the enrichment cards below</div>`);
   createMiniMap(demoCard.querySelector(".ai-card__minimap")!, x, y, 1);
-
-  const dominantHtml = enrichment ? buildDominantSegment(enrichment) : null;
-  addCard("purple", "Dominant segment", dominantHtml ?? `<div class="ai-card__stat-label">No Consumer Styles variables selected, or unavailable — check the Demographics privilege.</div>`);
 
   const popHtml = enrichment ? buildNearbyPopulation(enrichment) : null;
   const popCard = addCard("teal", "Nearby population", popHtml ?? `<div class="ai-card__stat-label">No population variables selected, or unavailable — check the Demographics privilege.</div>`);
@@ -455,39 +500,11 @@ async function renderResults(root: HTMLDivElement, data: any) {
   const ppHtml = enrichment ? buildPurchasingPower(enrichment) : null;
   addCard("teal", "Purchasing power", ppHtml ?? `<div class="ai-card__stat-label">No purchasing power / spending variables selected, or unavailable.</div>`);
 
-  addCard("teal", "Mobile carrier share", fakeDonutLegend([
-    ["Jio", "#0f6e56"], ["Airtel", "#5dcaa5"], ["Vi", "#b6771a"], ["BSNL", "#d85a30"],
-  ]));
-
   const pyramidHtml = enrichment ? buildAgePyramid(enrichment) : null;
   addCard("teal", "Population by age and sex", pyramidHtml ?? `<div class="ai-card__stat-label">No age-bracket variables selected, or unavailable.</div>`);
 
+  const additionalHtml = enrichment ? buildAdditionalDataCard(enrichment) : null;
+  if (additionalHtml) addCard("teal", "Additional demographics", additionalHtml);
+
   addCard("teal", "Geocoding response", `<pre class="ai-card__json">${JSON.stringify(rawAttributes, null, 2)}</pre>`);
-}
-
-function fakeInt(min: number, max: number) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function fakeSurveyBar() {
-  const a = fakeInt(10, 30), b = fakeInt(10, 30), c = fakeInt(10, 30);
-  const d = Math.max(5, 100 - a - b - c);
-  return `
-    <div class="survey-bar">
-      <div style="width:${a}%;background:#26215c"></div>
-      <div style="width:${b}%;background:#7f77dd"></div>
-      <div style="width:${c}%;background:#378add"></div>
-      <div style="width:${d}%;background:#1d9e75"></div>
-    </div>
-    <div class="ai-card__label" style="margin-top:6px">Placeholder — not a real survey dataset</div>
-  `;
-}
-
-function fakeDonutLegend(items: [string, string][]) {
-  return `
-    <div class="fake-legend">
-      ${items.map(([label, color]) => `<div class="fake-legend__row"><span class="fake-legend__swatch" style="background:${color}"></span>${label} — ${fakeInt(10, 50)}%</div>`).join("")}
-    </div>
-    <div class="ai-card__label" style="margin-top:8px">Placeholder — not a real dataset</div>
-  `;
 }
