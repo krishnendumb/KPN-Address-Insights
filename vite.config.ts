@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  base: "/AddressInsights/",
+    base: "/KPN-Address-Insights/",
   server: {
     port: 5173,
   },
