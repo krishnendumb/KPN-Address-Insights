@@ -15,6 +15,7 @@ import { ENRICHMENT_COLLECTIONS } from "./data/enrichmentVariables";
 
 let currentSceneView: SceneView | null = null;
 let miniViews: MapView[] = [];
+let poiCategoryList: string[] = [];
 
 function destroyAllViews() {
   currentSceneView?.destroy();
@@ -53,15 +54,16 @@ function getSelectedVariableKeys(root: HTMLElement): string[] {
 async function buildPoiPicker(container: HTMLElement) {
   container.innerHTML = `<calcite-loader label="Loading POI categories" active scale="s"></calcite-loader>`;
   const categories = await fetchPoiCategories();
+  poiCategoryList = categories;
   if (categories.length === 0) {
     container.innerHTML = `<calcite-notice open kind="warning" scale="s"><div slot="message">No POI categories loaded — check POI_LAYER_URL in services/poi.ts, and confirm the API key has item access to this layer.</div></calcite-notice>`;
     return;
   }
   container.innerHTML = `
     <calcite-block heading="Nearby places" description="Choose which categories to fetch from your uploaded POI layer" collapsible open>
-      ${categories.map((cat) => `
+      ${categories.map((cat, i) => `
         <calcite-label layout="inline" class="poi-checkbox-label">
-          <calcite-checkbox class="poi-checkbox" data-category="${cat}"></calcite-checkbox>
+          <calcite-checkbox class="poi-checkbox" data-index="${i}"></calcite-checkbox>
           ${cat}
         </calcite-label>
       `).join("")}
@@ -72,7 +74,7 @@ async function buildPoiPicker(container: HTMLElement) {
 function getSelectedPoiCategories(root: HTMLElement): string[] {
   return Array.from(root.querySelectorAll<any>(".poi-checkbox"))
     .filter((cb) => cb.checked)
-    .map((cb) => cb.dataset.category as string);
+    .map((cb) => poiCategoryList[Number(cb.dataset.index)]);
 }
 
 export function renderApp(root: HTMLElement) {

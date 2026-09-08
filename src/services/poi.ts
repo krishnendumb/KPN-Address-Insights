@@ -8,6 +8,7 @@ export const POI_LAYER_URL = "https://services8.arcgis.com/S3JihvJw7nZLbh8R/arcg
 
 const CATEGORY_FIELD = "ESRI_IND_1";
 
+
 export interface PoiResult {
   name: string;
   category: string;
@@ -53,14 +54,14 @@ export async function queryNearbyPois(
     distance: radiusMeters,
     units: "meters",
     spatialRelationship: "intersects",
-    // Escapes embedded single quotes so a category name can't break the
-    // where clause.
     where: `${CATEGORY_FIELD} = '${category.replace(/'/g, "''")}'`,
     outFields: ["NAME", CATEGORY_FIELD],
     outSpatialReference: { wkid: 4326 } as any,
   });
 
+  console.log(`[poi] querying category "${category}" — where: ${q.where}`);
   const result = await query.executeQueryJSON(POI_LAYER_URL, q);
+  console.log(`[poi] "${category}" returned ${result.features.length} feature(s)`);
 
   return result.features
     .map((f) => {
